@@ -1,0 +1,19 @@
+---
+
+postgresql_port: 5432
+patroni_restapi_port: 8008
+patroni_maximum_lag_on_replica: 1048576
+
+haproxy_listen_port:
+  master: 5000
+  replicas: 5001
+  stats: 7000
+
+haproxy_maxconn:
+  global: 100000
+  master: 10000
+  replica: 10000
+
+haproxy_timeout:
+  client: "60m"
+  server: "60m"

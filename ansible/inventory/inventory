@@ -1,0 +1,23 @@
+[all:vars]
+ansible_connection=ssh
+ansible_user=ksaley
+ansible_ssh_private_key_file=~/.ssh/atp
+ansible_python_interpreter=/usr/bin/python3
+
+[etcd_cluster]
+etcd1 ansible_host=77.105.182.79 ansible_port=32025 bind_address=192.168.1.79
+etcd2 ansible_host=77.105.182.79 ansible_port=32026 bind_address=192.168.1.80
+etcd3 ansible_host=77.105.182.79 ansible_port=32027 bind_address=192.168.1.81
+
+[master]
+bd1 ansible_host=77.105.182.79 ansible_port=32023 bind_address=192.168.1.77
+
+[replica]
+bd2 ansible_host=77.105.182.79 ansible_port=32024 bind_address=192.168.1.78
+
+[postgres_cluster:children]
+master
+replica
+
+[balancers]
+balancer ansible_host=77.105.182.79 ansible_port=32022 bind_address=192.168.1.76

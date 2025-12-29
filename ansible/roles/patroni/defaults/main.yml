@@ -1,0 +1,32 @@
+---
+
+postgresql_version: 16
+postgresql_port: 5432
+postgresql_listen_addr: "0.0.0.0"
+postgresql_encoding: "UTF8"
+postgresql_locale: "en_US.UTF-8"
+postgresql_data_checksums: true
+postgresql_password_encryption_algorithm: "scram-sha-256"
+postgresql_home_dir: "/var/lib/postgresql"
+postgresql_data_dir: "{{ postgresql_home_dir }}/{{ postgresql_version }}/main"
+postgresql_bin_dir: "/usr/lib/postgresql/{{ postgresql_version }}/bin"
+
+# Patroni
+patroni_cluster_name: "postgres-cluster-12-student-test1"
+patroni_restapi_port: 8008
+patroni_restapi_protocol: "http"
+patroni_etcd_protocol: "http"
+patroni_etcd_namespace: "service"
+patroni_maximum_lag_on_failover: 1048576
+patroni_maximum_lag_on_replica: 1048576
+
+# Credentials
+patroni_superuser_username: "postgres"
+patroni_superuser_password: ""
+patroni_replication_username: "replicator"
+patroni_replication_password: ""
+
+# API database
+api_database_name: "api_db"
+api_database_user: "api_user"
+api_database_password: ""

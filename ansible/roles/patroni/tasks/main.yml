@@ -1,0 +1,840 @@
+---
+- name: Flush handlers
+  ansible.builtin.meta: flush_handlers
+
+- name: Gather package facts
+  ansible.builtin.package_facts:
+    manager: auto
+  when: ansible_facts.packages is not defined
+  check_mode: false
+
+- name: Install PostgreSQL (Debian)
+  ansible.builtin.apt:
+    name:
+      - postgresql-{{ postgresql_version }}
+      - postgresql-client-{{ postgresql_version }}
+      - python3-psycopg2
+    state: present
+    update_cache: true
+  register: apt_status
+  until: apt_status is success
+  delay: 5
+  retries: 3
+  when: ansible_os_family == "Debian"
+  tags: [patroni, patroni_install]
+
+- name: Install PostgreSQL (RedHat)
+  ansible.builtin.dnf:
+    name:
+      - postgresql{{ postgresql_version }}-server
+      - postgresql{{ postgresql_version }}
+      - python3-psycopg2
+    state: present
+  register: dnf_status
+  until: dnf_status is success
+  delay: 5
+  retries: 3
+  when: ansible_os_family == "RedHat"
+  tags: [patroni, patroni_install]
+
+- name: Install pip and systemd support
+  ansible.builtin.package:
+    name: [python3-pip, python3-setuptools, python3-venv, python3-systemd]
+    state: present
+  tags: [patroni, patroni_install]
+
+- name: Install Patroni
+  ansible.builtin.pip:
+    name: [patroni, python-etcd]
+    state: latest
+    executable: pip3
+    extra_args: "--break-system-packages"
+  tags: [patroni, patroni_install]
+
+- name: Create directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "{{ item.mode }}"
+  loop:
+    - {path: /etc/patroni, mode: "0750"}
+    - {path: "{{ postgresql_data_dir }}", mode: "0700"}
+  tags: [patroni, patroni_conf]
+
+- name: Stop Patroni on all nodes before removing etcd keys
+  ansible.builtin.systemd:
+    name: patroni
+    state: stopped
+  ignore_errors: true
+  when: inventory_hostname in groups['postgres_cluster']
+  tags: [patroni, patroni_conf]
+
+- name: Wait for all Patroni instances to fully stop
+  ansible.builtin.pause:
+    seconds: 5
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_conf]
+
+- name: Set force reinit flag
+  ansible.builtin.set_fact:
+    force_reinit: "{{ patroni_force_reinit | default(false) | bool }}"
+  tags: [patroni, patroni_conf]
+
+- name: Check if PostgreSQL data directory is initialized
+  ansible.builtin.stat:
+    path: "{{ postgresql_data_dir }}/PG_VERSION"
+  register: pg_data_initialized
+  tags: [patroni, patroni_conf]
+
+- name: Determine if we need to remove etcd keys
+  ansible.builtin.set_fact:
+    should_remove_etcd: "{{ force_reinit | bool or (not pg_data_initialized.stat.exists | default(false)) }}"
+  tags: [patroni, patroni_conf]
+
+- name: Determine if we need to remove data directory
+  ansible.builtin.set_fact:
+    should_remove_data: "{{ force_reinit | bool or ((not patroni_keep_existing_data | default(false)) and (not pg_data_initialized.stat.exists | default(false))) }}"
+  tags: [patroni, patroni_conf]
+
+- name: Remove Patroni cluster from etcd using patronictl (if config exists)
+  ansible.builtin.command: >
+    patronictl -c /etc/patroni/patroni.yml remove {{ patroni_cluster_name }} --force
+  register: patronictl_remove
+  changed_when: patronictl_remove.rc == 0
+  failed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - should_remove_etcd | bool
+  tags: [patroni, patroni_conf]
+
+- name: Remove all cluster keys from etcd (including initialize, leader, members, etc)
+  ansible.builtin.shell: >
+    etcdctl --endpoints={{ patroni_etcd_protocol }}://{{ hostvars[groups['etcd_cluster'][0]]['bind_address'] }}:2379
+    del --prefix /{{ patroni_etcd_namespace }}/{{ patroni_cluster_name }}/
+  register: etcd_remove_all
+  changed_when: "'deleted' in etcd_remove_all.stdout or etcd_remove_all.rc == 0"
+  failed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - should_remove_etcd | bool
+  tags: [patroni, patroni_conf]
+
+- name: Remove initialize key from etcd using etcdctl (specific key)
+  ansible.builtin.shell: >
+    etcdctl --endpoints={{ patroni_etcd_protocol }}://{{ hostvars[groups['etcd_cluster'][0]]['bind_address'] }}:2379
+    del /{{ patroni_etcd_namespace }}/{{ patroni_cluster_name }}/initialize
+  register: etcd_remove_init
+  changed_when: "'deleted' in etcd_remove_init.stdout or '1' in etcd_remove_init.stdout or etcd_remove_init.rc == 0"
+  failed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - should_remove_etcd | bool
+    - etcd_remove_all.rc != 0 | default(true)
+  tags: [patroni, patroni_conf]
+
+- name: Verify all keys were removed
+  ansible.builtin.shell: >
+    etcdctl --endpoints={{ patroni_etcd_protocol }}://{{ hostvars[groups['etcd_cluster'][0]]['bind_address'] }}:2379
+    get --prefix /{{ patroni_etcd_namespace }}/{{ patroni_cluster_name }}/
+  register: etcd_verify_removal
+  changed_when: false
+  failed_when: etcd_verify_removal.stdout | length > 0
+  when: 
+    - inventory_hostname in groups['master']
+    - should_remove_etcd | bool
+  tags: [patroni, patroni_conf]
+
+- name: Display verification result
+  ansible.builtin.debug:
+    msg: "{{ 'Keys successfully removed' if etcd_verify_removal.stdout | length == 0 else 'Warning: Some keys still exist: ' + etcd_verify_removal.stdout }}"
+  when: 
+    - inventory_hostname in groups['master']
+    - should_remove_etcd | bool
+    - etcd_verify_removal is defined
+  tags: [patroni, patroni_conf]
+
+- name: Remove existing PostgreSQL data directory (when force_reinit or not keeping existing data)
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: absent
+  when: 
+    - should_remove_data | bool
+    - pg_data_initialized.stat.exists | default(false)
+  tags: [patroni, patroni_conf]
+
+- name: Remove PostgreSQL data directory when force_reinit is true (always)
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: absent
+  when: 
+    - force_reinit | bool
+    - inventory_hostname in groups['postgres_cluster']
+  tags: [patroni, patroni_conf]
+  
+- name: Recreate data directory after removal
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+  when: 
+    - should_remove_data | bool or (force_reinit | bool)
+    - (pg_data_initialized.stat.exists | default(false)) or (force_reinit | bool)
+  tags: [patroni, patroni_conf]
+
+- name: Generate superuser password
+  ansible.builtin.set_fact:
+    patroni_superuser_password: "{{ patroni_superuser_password | default(lookup('password', '/dev/null length=32 chars=ascii_letters,digits'), true) }}"
+  when: patroni_superuser_password | length == 0
+  tags: [patroni, patroni_conf]
+
+- name: Generate replication password
+  ansible.builtin.set_fact:
+    patroni_replication_password: "{{ patroni_replication_password | default(lookup('password', '/dev/null length=32 chars=ascii_letters,digits'), true) }}"
+  when: patroni_replication_password | length == 0
+  tags: [patroni, patroni_conf]
+
+- name: Create patroni config
+  ansible.builtin.template:
+    src: patroni.yml.j2
+    dest: /etc/patroni/patroni.yml
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  tags: [patroni, patroni_conf]
+
+- name: Find patroni binary path
+  ansible.builtin.shell: |
+    BIN_PATH=""
+    # Try which/command first (finds in PATH)
+    if BIN_PATH=$(command -v patroni 2>/dev/null); then
+      echo "$BIN_PATH"
+    # Check common locations
+    elif [ -f /usr/local/bin/patroni ]; then
+      echo "/usr/local/bin/patroni"
+    elif [ -f /usr/bin/patroni ]; then
+      echo "/usr/bin/patroni"
+    # Check pip user installation location
+    elif [ -f ~/.local/bin/patroni ]; then
+      echo "$HOME/.local/bin/patroni"
+    # Check if installed via pip in system location
+    elif [ -f /usr/local/bin/patroni ]; then
+      echo "/usr/local/bin/patroni"
+    else
+      # Last resort: try to find it
+      FOUND=$(find /usr -name patroni -type f 2>/dev/null | head -1)
+      if [ -n "$FOUND" ]; then
+        echo "$FOUND"
+      else
+        echo "/usr/local/bin/patroni"
+      fi
+    fi
+  register: patroni_binary_path
+  changed_when: false
+  tags: [patroni, patroni_service]
+
+- name: Set patroni binary path
+  ansible.builtin.set_fact:
+    patroni_binary: "{{ patroni_binary_path.stdout_lines[0] | default(patroni_binary_path.stdout | default('/usr/local/bin/patroni')) | trim }}"
+  tags: [patroni, patroni_service]
+
+- name: Verify patroni binary exists
+  ansible.builtin.stat:
+    path: "{{ patroni_binary }}"
+  register: patroni_binary_stat
+  tags: [patroni, patroni_service]
+
+- name: Display found patroni binary path
+  ansible.builtin.debug:
+    msg: "Found patroni binary at: {{ patroni_binary }} (exists: {{ patroni_binary_stat.stat.exists | default(false) }})"
+  tags: [patroni, patroni_service]
+
+- name: Fail if patroni binary not found
+  ansible.builtin.fail:
+    msg: |
+      Patroni binary not found at {{ patroni_binary }}.
+      Please run the installation tasks first:
+      ansible-playbook -i inventory/inventory playbooks/deploy_patroni_cluster.yml --tags patroni_install
+  when: not patroni_binary_stat.stat.exists
+  tags: [patroni, patroni_service]
+
+- name: Create patroni service
+  ansible.builtin.template:
+    src: patroni.service.j2
+    dest: /etc/systemd/system/patroni.service
+    owner: root
+    group: root
+    mode: "0644"
+  tags: [patroni, patroni_service]
+
+- name: Ensure data directory exists and has correct permissions
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Check if data directory is empty before starting
+  ansible.builtin.stat:
+    path: "{{ postgresql_data_dir }}/PG_VERSION"
+  register: pg_version_file
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Force remove etcd initialize key before starting (if data dir is empty)
+  ansible.builtin.shell: >
+    etcdctl --endpoints={{ patroni_etcd_protocol }}://{{ hostvars[groups['etcd_cluster'][0]]['bind_address'] }}:2379
+    del /{{ patroni_etcd_namespace }}/{{ patroni_cluster_name }}/initialize
+  register: force_etcd_remove
+  changed_when: "'deleted' in force_etcd_remove.stdout or '1' in force_etcd_remove.stdout or force_etcd_remove.rc == 0"
+  failed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - not pg_version_file.stat.exists | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Stop any existing PostgreSQL service (Patroni manages it)
+  ansible.builtin.systemd:
+    name: postgresql
+    state: stopped
+    enabled: false
+  ignore_errors: true
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Stop PostgreSQL service for specific version
+  ansible.builtin.systemd:
+    name: "postgresql@{{ postgresql_version }}-main"
+    state: stopped
+    enabled: false
+  ignore_errors: true
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Check if leader exists in etcd before starting
+  ansible.builtin.shell: >
+    etcdctl --endpoints={{ patroni_etcd_protocol }}://{{ hostvars[groups['etcd_cluster'][0]]['bind_address'] }}:2379
+    get /{{ patroni_etcd_namespace }}/{{ patroni_cluster_name }}/leader
+  register: etcd_leader_check
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Re-check data directory status
+  ansible.builtin.stat:
+    path: "{{ postgresql_data_dir }}/PG_VERSION"
+  register: pg_version_file_recheck
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Stop Patroni if no leader exists and data directory exists (to allow cleanup)
+  ansible.builtin.systemd:
+    name: patroni
+    state: stopped
+  ignore_errors: true
+  when: 
+    - inventory_hostname in groups['master']
+    - etcd_leader_check.rc != 0
+    - pg_version_file_recheck.stat.exists | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Remove data directory if no leader exists (blocking bootstrap)
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: absent
+  when: 
+    - inventory_hostname in groups['master']
+    - pg_version_file_recheck.stat.exists | default(false)
+    - etcd_leader_check.rc != 0
+  tags: [patroni, patroni_start]
+
+- name: Recreate data directory after removal
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+  when: 
+    - inventory_hostname in groups['master']
+    - pg_version_file_recheck.stat.exists | default(false)
+    - etcd_leader_check.rc != 0
+  tags: [patroni, patroni_start]
+
+- name: Remove all etcd keys if no leader exists (clean slate for bootstrap)
+  ansible.builtin.shell: >
+    etcdctl --endpoints={{ patroni_etcd_protocol }}://{{ hostvars[groups['etcd_cluster'][0]]['bind_address'] }}:2379
+    del --prefix /{{ patroni_etcd_namespace }}/{{ patroni_cluster_name }}/
+  register: etcd_cleanup_before_start
+  changed_when: "'deleted' in etcd_cleanup_before_start.stdout or etcd_cleanup_before_start.rc == 0"
+  failed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - etcd_leader_check.rc != 0
+  tags: [patroni, patroni_start]
+
+- name: Start patroni on master
+  ansible.builtin.systemd:
+    daemon_reload: true
+    name: patroni
+    enabled: true
+    state: restarted
+  register: patroni_start_result
+  failed_when: false
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Get patroni service status after start attempt
+  ansible.builtin.command: systemctl status patroni.service --no-pager
+  register: patroni_status
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Display patroni service status
+  ansible.builtin.debug:
+    var: patroni_status.stdout_lines
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Get recent patroni logs
+  ansible.builtin.command: journalctl -u patroni.service -n 50 --no-pager
+  register: patroni_logs
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Display recent patroni logs
+  ansible.builtin.debug:
+    var: patroni_logs.stdout_lines
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Check for system ID mismatch error
+  ansible.builtin.set_fact:
+    system_id_mismatch: "{{ 'system ID mismatch' in (patroni_logs.stdout | default('') + patroni_logs.stderr | default('')) }}"
+  when: 
+    - inventory_hostname in groups['master']
+    - patroni_logs is defined
+  tags: [patroni, patroni_start]
+
+- name: Fail with helpful message if system ID mismatch detected
+  ansible.builtin.fail:
+    msg: |
+      CRITICAL: System ID mismatch detected!
+      
+      The PostgreSQL data directory on {{ inventory_hostname }} has a different system ID
+      than what's stored in etcd. This happens when the data directory was initialized
+      with a different cluster.
+      
+      To fix this, run the playbook with force_reinit=true:
+      
+      ansible-playbook -i inventory/inventory playbooks/deploy_patroni_cluster.yml \
+        -e patroni_force_reinit=true
+      
+      This will:
+      1. Stop Patroni on all nodes
+      2. Remove all etcd keys for the cluster
+      3. Remove the PostgreSQL data directory
+      4. Bootstrap a fresh cluster
+  when: 
+    - inventory_hostname in groups['master']
+    - system_id_mismatch | default(false) | bool
+  tags: [patroni, patroni_start]
+
+- name: Fail if patroni did not start
+  ansible.builtin.fail:
+    msg: "Patroni service failed to start. Check the logs above for details."
+  when: 
+    - inventory_hostname in groups['master']
+    - patroni_start_result.failed | default(false) or patroni_status.rc != 0
+  tags: [patroni, patroni_start]
+
+- name: Wait for patroni API on master
+  ansible.builtin.wait_for:
+    port: "{{ patroni_restapi_port }}"
+    host: "{{ patroni_bind_address }}"
+    state: started
+    timeout: 120
+    delay: 10
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Check etcd initialize key status
+  ansible.builtin.shell: >
+    etcdctl --endpoints={{ patroni_etcd_protocol }}://{{ hostvars[groups['etcd_cluster'][0]]['bind_address'] }}:2379
+    get /{{ patroni_etcd_namespace }}/{{ patroni_cluster_name }}/initialize
+  register: etcd_initialize_check
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Display etcd initialize key status
+  ansible.builtin.debug:
+    msg: "Initialize key exists: {{ etcd_initialize_check.rc == 0 }}, value: {{ etcd_initialize_check.stdout | default('not set') }}"
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Check if there's a leader in cluster
+  ansible.builtin.uri:
+    url: "http://{{ patroni_bind_address }}:{{ patroni_restapi_port }}/cluster"
+    method: GET
+  register: cluster_check_before
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Remove initialize key if no leader exists (to allow bootstrap)
+  ansible.builtin.shell: >
+    etcdctl --endpoints={{ patroni_etcd_protocol }}://{{ hostvars[groups['etcd_cluster'][0]]['bind_address'] }}:2379
+    del /{{ patroni_etcd_namespace }}/{{ patroni_cluster_name }}/initialize
+  register: remove_init_key
+  changed_when: "'deleted' in remove_init_key.stdout or '1' in remove_init_key.stdout or remove_init_key.rc == 0"
+  failed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - etcd_initialize_check.rc == 0
+    - (cluster_check_before.json.members | 
+       selectattr('role', 'equalto', 'leader') | 
+       list | 
+       length) == 0
+  tags: [patroni, patroni_start]
+
+- name: Remove leader key if it exists (to allow bootstrap)
+  ansible.builtin.shell: >
+    etcdctl --endpoints={{ patroni_etcd_protocol }}://{{ hostvars[groups['etcd_cluster'][0]]['bind_address'] }}:2379
+    del /{{ patroni_etcd_namespace }}/{{ patroni_cluster_name }}/leader
+  register: remove_leader_key
+  changed_when: "'deleted' in remove_leader_key.stdout or '1' in remove_leader_key.stdout or remove_leader_key.rc == 0"
+  failed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - (cluster_check_before.json.members | 
+       selectattr('role', 'equalto', 'leader') | 
+       list | 
+       length) == 0
+  tags: [patroni, patroni_start]
+
+- name: Restart Patroni after removing blocking keys
+  ansible.builtin.systemd:
+    name: patroni
+    state: restarted
+  when: 
+    - inventory_hostname in groups['master']
+    - remove_init_key.changed | default(false) or remove_leader_key.changed | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Wait a moment for Patroni to restart
+  ansible.builtin.pause:
+    seconds: 5
+  when: 
+    - inventory_hostname in groups['master']
+    - remove_init_key.changed | default(false) or remove_leader_key.changed | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Wait for master to become leader (with bootstrap support)
+  ansible.builtin.uri:
+    url: "http://{{ patroni_bind_address }}:{{ patroni_restapi_port }}/cluster"
+    method: GET
+  register: cluster_status
+  until: >
+    cluster_status.status == 200 and
+    cluster_status.json is defined and
+    cluster_status.json.members is defined and
+    (
+      (cluster_status.json.members | 
+       selectattr('role', 'equalto', 'leader') | 
+       list | 
+       length > 0) or
+      (cluster_status.json.members | 
+       selectattr('state', 'equalto', 'running') | 
+       list | 
+       length > 0) or
+      (cluster_status.json.members | 
+       selectattr('state', 'equalto', 'creating replica') | 
+       list | 
+       length > 0) or
+      (cluster_status.json.members | 
+       selectattr('state', 'equalto', 'initdb') | 
+       list | 
+       length > 0)
+    )
+  retries: 120
+  delay: 10
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Check if still waiting after initial wait
+  ansible.builtin.uri:
+    url: "http://{{ patroni_bind_address }}:{{ patroni_restapi_port }}/cluster"
+    method: GET
+  register: cluster_status_mid
+  changed_when: false
+  failed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status is defined
+    - (cluster_status.status | default(0) != 200) or (cluster_status.json is defined and cluster_status.json.members is defined and (cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 0)
+  tags: [patroni, patroni_start]
+
+- name: Check if data directory exists and might be blocking bootstrap
+  ansible.builtin.stat:
+    path: "{{ postgresql_data_dir }}/PG_VERSION"
+  register: pg_data_exists_check
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status is defined
+    - (cluster_status.status | default(0) != 200) or (cluster_status.json is defined and cluster_status.json.members is defined and (cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 0)
+  tags: [patroni, patroni_start]
+
+- name: Stop Patroni before removing data directory
+  ansible.builtin.systemd:
+    name: patroni
+    state: stopped
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status is defined
+    - (cluster_status.status | default(0) != 200) or (cluster_status.json is defined and cluster_status.json.members is defined and (cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 0)
+    - pg_data_exists_check.stat.exists | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Remove data directory if Patroni is stuck waiting
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: absent
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status is defined
+    - (cluster_status.status | default(0) != 200) or (cluster_status.json is defined and cluster_status.json.members is defined and (cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 0)
+    - pg_data_exists_check.stat.exists | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Recreate data directory after removal
+  ansible.builtin.file:
+    path: "{{ postgresql_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status is defined
+    - (cluster_status.status | default(0) != 200) or (cluster_status.json is defined and cluster_status.json.members is defined and (cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 0)
+    - pg_data_exists_check.stat.exists | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Remove all etcd keys again after data directory removal
+  ansible.builtin.shell: >
+    etcdctl --endpoints={{ patroni_etcd_protocol }}://{{ hostvars[groups['etcd_cluster'][0]]['bind_address'] }}:2379
+    del --prefix /{{ patroni_etcd_namespace }}/{{ patroni_cluster_name }}/
+  register: etcd_remove_after_data_cleanup
+  changed_when: "'deleted' in etcd_remove_after_data_cleanup.stdout or etcd_remove_after_data_cleanup.rc == 0"
+  failed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status is defined
+    - (cluster_status.status | default(0) != 200) or (cluster_status.json is defined and cluster_status.json.members is defined and (cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 0)
+    - pg_data_exists_check.stat.exists | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Start Patroni after data directory cleanup
+  ansible.builtin.systemd:
+    name: patroni
+    state: started
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status is defined
+    - (cluster_status.status | default(0) != 200) or (cluster_status.json is defined and cluster_status.json.members is defined and (cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 0)
+    - pg_data_exists_check.stat.exists | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Wait after restarting Patroni
+  ansible.builtin.pause:
+    seconds: 10
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status is defined
+    - (cluster_status.status | default(0) != 200) or (cluster_status.json is defined and cluster_status.json.members is defined and (cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 0)
+    - pg_data_exists_check.stat.exists | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Wait for master to bootstrap after data directory cleanup
+  ansible.builtin.uri:
+    url: "http://{{ patroni_bind_address }}:{{ patroni_restapi_port }}/cluster"
+    method: GET
+  register: cluster_status_after_cleanup
+  until: >
+    cluster_status_after_cleanup.status == 200 and
+    cluster_status_after_cleanup.json is defined and
+    cluster_status_after_cleanup.json.members is defined and
+    (
+      (cluster_status_after_cleanup.json.members | 
+       selectattr('role', 'equalto', 'leader') | 
+       list | 
+       length > 0) or
+      (cluster_status_after_cleanup.json.members | 
+       selectattr('state', 'equalto', 'running') | 
+       list | 
+       length > 0) or
+      (cluster_status_after_cleanup.json.members | 
+       selectattr('state', 'equalto', 'creating replica') | 
+       list | 
+       length > 0) or
+      (cluster_status_after_cleanup.json.members | 
+       selectattr('state', 'equalto', 'initdb') | 
+       list | 
+       length > 0)
+    )
+  retries: 120
+  delay: 10
+  changed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status is defined
+    - (cluster_status.status | default(0) != 200) or (cluster_status.json is defined and cluster_status.json.members is defined and (cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 0)
+    - pg_data_exists_check.stat.exists | default(false)
+  tags: [patroni, patroni_start]
+
+- name: Check Patroni logs for errors if still waiting
+  ansible.builtin.command: journalctl -u patroni.service -n 20 --no-pager | grep -i "error\|critical\|mismatch\|waiting" || true
+  register: patroni_error_logs
+  changed_when: false
+  failed_when: false
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status is defined
+    - (cluster_status.status | default(0) != 200) or (cluster_status.json is defined and cluster_status.json.members is defined and (cluster_status.json.members | selectattr('role', 'equalto', 'leader') | list | length) == 0)
+  tags: [patroni, patroni_start]
+
+- name: Display error logs if found
+  ansible.builtin.debug:
+    msg: "Patroni error logs: {{ patroni_error_logs.stdout | default(patroni_error_logs | default({}) | string) | default('no errors found') }}"
+  when: 
+    - inventory_hostname in groups['master']
+    - patroni_error_logs is defined
+    - (patroni_error_logs.stdout is defined and patroni_error_logs.stdout | length > 0) or (patroni_error_logs.stdout is not defined)
+  tags: [patroni, patroni_start]
+
+- name: Check cluster status after wait
+  ansible.builtin.uri:
+    url: "http://{{ patroni_bind_address }}:{{ patroni_restapi_port }}/cluster"
+    method: GET
+  register: cluster_status_final
+  changed_when: false
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Display cluster status
+  ansible.builtin.debug:
+    msg: |
+      Cluster members:
+      {% for member in cluster_status_final.json.members | default([]) %}
+      - {{ member.name }}: role={{ member.role | default('unknown') }}, state={{ member.state | default('unknown') }}
+      {% endfor %}
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status_final.json is defined
+  tags: [patroni, patroni_start]
+
+- name: Verify leader exists
+  ansible.builtin.fail:
+    msg: |
+      No leader found in cluster after waiting. Cluster state:
+      {{ cluster_status_final.json | default('not available') }}
+      
+      If Patroni is stuck in "waiting for leader to bootstrap", try:
+      1. Check if initialize key exists in etcd
+      2. Remove it if it points to a different node
+      3. Restart Patroni service
+  when: 
+    - inventory_hostname in groups['master']
+    - cluster_status_final.json is defined
+    - (cluster_status_final.json.members | 
+       selectattr('role', 'equalto', 'leader') | 
+       list | 
+       length) == 0
+  tags: [patroni, patroni_start]
+
+- name: Wait for PostgreSQL on master
+  become: true
+  become_user: postgres
+  ansible.builtin.command: "{{ postgresql_bin_dir }}/pg_isready -h localhost -p {{ postgresql_port }}"
+  register: pg_isready_result
+  until: pg_isready_result.rc == 0
+  retries: 60
+  delay: 10
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname in groups['master']
+  tags: [patroni, patroni_start]
+
+- name: Start patroni on replicas
+  ansible.builtin.systemd:
+    daemon_reload: true
+    name: patroni
+    enabled: true
+    state: restarted
+  when: inventory_hostname in groups['replica']
+  tags: [patroni, patroni_start]
+
+- name: Wait for patroni API on replicas
+  ansible.builtin.wait_for:
+    port: "{{ patroni_restapi_port }}"
+    host: "{{ patroni_bind_address }}"
+    state: started
+    timeout: 120
+    delay: 10
+  when: inventory_hostname in groups['replica']
+  tags: [patroni, patroni_start]
+
+- name: Show cluster status
+  ansible.builtin.debug:
+    msg: "Patroni {{ patroni_cluster_name }} running on {{ ansible_hostname }}"
+  tags: [patroni, patroni_status]
+
+- name: Create API user
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_user:
+    name: "{{ api_database_user }}"
+    password: "{{ api_database_password }}"
+    role_attr_flags: LOGIN
+    login_host: 127.0.0.1
+    login_port: "{{ postgresql_port }}"
+    login_user: "{{ patroni_superuser_username }}"
+    login_password: "{{ patroni_superuser_password }}"
+  when:
+    - inventory_hostname in groups['master']
+    - api_database_user is defined
+  tags: [patroni, postgresql_users]
+
+- name: Create API database
+  become: true
+  become_user: postgres
+  community.postgresql.postgresql_db:
+    name: "{{ api_database_name }}"
+    owner: "{{ api_database_user }}"
+    encoding: UTF8
+    lc_collate: en_US.UTF-8
+    lc_ctype: en_US.UTF-8
+    login_host: 127.0.0.1
+    login_port: "{{ postgresql_port }}"
+    login_user: "{{ patroni_superuser_username }}"
+    login_password: "{{ patroni_superuser_password }}"
+  when:
+    - inventory_hostname in groups['master']
+    - api_database_name is defined
+  tags: [patroni, postgresql_databases]

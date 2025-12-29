@@ -1,0 +1,120 @@
+---
+- name: Init
+  hosts: localhost
+  gather_facts: true
+  any_errors_fatal: true
+
+- name: Prepare nodes
+  hosts: "etcd_cluster:postgres_cluster"
+  become: true
+  become_method: sudo
+  gather_facts: true
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      register: apt_status
+      until: apt_status is success
+      delay: 5
+      retries: 3
+      when: ansible_os_family == "Debian"
+
+    - name: Set bind_address
+      ansible.builtin.set_fact:
+        bind_address: "{{ bind_address | default(ansible_default_ipv4.address, true) }}"
+      tags: always
+  roles:
+    - role: etcd
+      when: "'etcd_cluster' in group_names"
+
+- name: Deploy PostgreSQL
+  hosts: postgres_cluster
+  become: true
+  become_method: sudo
+  gather_facts: true
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Get all IP addresses on the server
+      ansible.builtin.setup:
+        gather_subset: network
+      tags: always
+
+    - name: Check if bind_address exists on server
+      ansible.builtin.set_fact:
+        bind_address_exists: "{{ bind_address in ansible_all_ipv4_addresses | default([]) }}"
+      tags: always
+
+    - name: Set bind_address to actual IP if specified doesn't exist
+      ansible.builtin.set_fact:
+        bind_address: "{{ ansible_default_ipv4.address }}"
+      when: 
+        - bind_address is defined
+        - not bind_address_exists | default(false)
+      tags: always
+
+    - name: Set bind_address default if not defined
+      ansible.builtin.set_fact:
+        bind_address: "{{ bind_address | default(ansible_default_ipv4.address, true) }}"
+      tags: always
+
+    - name: Set patroni_bind_address
+      ansible.builtin.set_fact:
+        patroni_bind_address: "{{ bind_address }}"
+      tags: always
+
+    - name: Display bind address being used
+      ansible.builtin.debug:
+        msg: "Using bind_address: {{ bind_address }} (patroni_bind_address: {{ patroni_bind_address }})"
+      tags: always
+  roles:
+    - role: patroni
+  post_tasks:
+    - name: Wait for cluster
+      ansible.builtin.uri:
+        url: "{{ patroni_restapi_protocol }}://{{ patroni_bind_address }}:{{ patroni_restapi_port }}/cluster"
+        method: GET
+      register: cluster_status
+      until: cluster_status.status == 200
+      retries: 30
+      delay: 5
+      changed_when: false
+      when: inventory_hostname == groups['master'][0]
+
+- name: Deploy HAProxy
+  hosts: balancers
+  become: true
+  become_method: sudo
+  gather_facts: true
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Set bind_address
+      ansible.builtin.set_fact:
+        bind_address: "{{ bind_address | default(ansible_default_ipv4.address, true) }}"
+      tags: always
+  roles:
+    - role: haproxy
+  post_tasks:
+    - name: Verify HAProxy
+      ansible.builtin.uri:
+        url: "http://{{ bind_address }}:{{ haproxy_listen_port.stats }}"
+        method: GET
+      register: haproxy_stats
+      until: haproxy_stats.status == 200
+      retries: 10
+      delay: 2
+      changed_when: false
+
+- name: Summary
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Print info
+      ansible.builtin.debug:
+        msg:
+          - "Deployment complete"
+          - "etcd: {{ groups['etcd_cluster'] | join(', ') }}"
+          - "master: {{ groups['master'] | join(', ') }}"
+          - "replica: {{ groups['replica'] | join(', ') }}"
+          - "haproxy: {{ groups['balancers'] | join(', ') }}"

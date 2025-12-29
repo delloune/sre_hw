@@ -1,0 +1,58 @@
+---
+patroni_cluster_name: "postgres-cluster-12-student-test1"
+
+# Credentials (set via environment variables)
+patroni_superuser_username: "postgres"
+patroni_superuser_password: "{{ lookup('env', 'PATRONI_SUPERUSER_PASSWORD') | default('', true) }}"
+patroni_replication_username: "replicator"
+patroni_replication_password: "{{ lookup('env', 'PATRONI_REPLICATION_PASSWORD') | default('', true) }}"
+
+# PostgreSQL
+postgresql_version: 16
+postgresql_port: 5432
+postgresql_listen_addr: "0.0.0.0"
+postgresql_encoding: "UTF8"
+postgresql_locale: "en_US.UTF-8"
+postgresql_data_checksums: true
+postgresql_password_encryption_algorithm: "scram-sha-256"
+
+# PostgreSQL paths
+postgresql_home_dir: "/var/lib/postgresql"
+postgresql_data_dir: "{{ postgresql_home_dir }}/{{ postgresql_version }}/main"
+postgresql_bin_dir: "/usr/lib/postgresql/{{ postgresql_version }}/bin"
+
+# Installation
+installation_method: "packages"
+
+# etcd
+etcd_version: "3.5.21"
+etcd_package_repo: "https://github.com/etcd-io/etcd/releases/download/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-amd64.tar.gz"
+etcd_conf_dir: "/etc/etcd"
+etcd_data_dir: "/var/lib/etcd"
+etcd_cluster_name: "etcd-{{ patroni_cluster_name }}"
+
+# Patroni
+patroni_etcd_protocol: "http"
+patroni_etcd_namespace: "service"
+patroni_restapi_port: 8008
+patroni_restapi_protocol: "http"
+patroni_maximum_lag_on_failover: 1048576
+patroni_maximum_lag_on_replica: 1048576
+
+# HAProxy
+haproxy_listen_port:
+  master: 5000
+  replicas: 5001
+  stats: 7000
+haproxy_maxconn:
+  global: 100000
+  master: 10000
+  replica: 10000
+haproxy_timeout:
+  client: "60m"
+  server: "60m"
+
+# API database
+api_database_name: "api_db"
+api_database_user: "api_user"
+api_database_password: "{{ lookup('env', 'API_DATABASE_PASSWORD') | default('', true) }}"

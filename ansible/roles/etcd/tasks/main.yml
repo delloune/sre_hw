@@ -1,0 +1,107 @@
+---
+- name: Set etcd bind address
+  ansible.builtin.set_fact:
+    etcd_bind_address: "{{ etcd_bind_address | default(bind_address) }}"
+
+- name: Install etcd dependencies
+  ansible.builtin.package:
+    name: [unzip, tar]
+    state: present
+  tags: [etcd, etcd_install]
+
+- name: Install etcd
+  block:
+    - name: Download etcd
+      ansible.builtin.get_url:
+        url: "{{ etcd_package_repo }}"
+        dest: /tmp/
+        timeout: 60
+        validate_certs: false
+
+    - name: Extract etcd
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ etcd_package_repo | basename }}"
+        dest: /tmp/
+        extra_opts: [--no-same-owner]
+        remote_src: true
+
+    - name: Install etcd binaries
+      ansible.builtin.copy:
+        src: "/tmp/{{ etcd_package_repo.split('.tar.gz')[0] | basename }}/{{ item }}"
+        dest: /usr/local/bin/{{ item }}
+        mode: "0755"
+        remote_src: true
+      loop: [etcd, etcdctl]
+  when: >
+    installation_method | default('packages') == "packages" and
+    (etcd_package_repo is defined and etcd_package_repo | default('') | length > 0)
+  tags: [etcd, etcd_install]
+
+- name: Setup etcd user and directories
+  block:
+    - name: Create etcd user
+      ansible.builtin.user:
+        name: etcd
+        shell: /usr/sbin/nologin
+        home: "{{ etcd_data_dir }}"
+        system: true
+
+    - name: Create etcd directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: etcd
+        group: etcd
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: "{{ etcd_conf_dir }}", mode: "0750"}
+        - {path: "{{ etcd_data_dir }}", mode: "0700"}
+  tags: [etcd, etcd_conf]
+
+- name: Configure etcd
+  block:
+    - name: Generate etcd config
+      ansible.builtin.template:
+        src: etcd.conf.j2
+        dest: "{{ etcd_conf_dir }}/etcd.conf"
+
+    - name: Create etcd service
+      ansible.builtin.template:
+        src: etcd.service.j2
+        dest: /etc/systemd/system/etcd.service
+  tags: [etcd, etcd_conf]
+
+- name: Start and verify etcd
+  block:
+    - name: Start etcd service
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: etcd
+        enabled: true
+        state: started
+
+    - name: Wait for etcd to be ready
+      ansible.builtin.wait_for:
+        port: 2379
+        host: 127.0.0.1
+        state: started
+        timeout: 120
+        delay: 10
+
+    - name: Verify etcd health
+      ansible.builtin.command: >
+        /usr/local/bin/etcdctl endpoint health
+        --endpoints={{ patroni_etcd_protocol }}://{{ etcd_bind_address }}:2379
+      environment:
+        ETCDCTL_API: "3"
+      register: etcd_health_result
+      until: "'is healthy' in (etcd_health_result.stdout + etcd_health_result.stderr)"
+      retries: 10
+      delay: 10
+      changed_when: false
+
+    - name: Display etcd status
+      ansible.builtin.debug:
+        msg: "{{ etcd_health_result.stdout | default(etcd_health_result.stderr) }}"
+  when: not ansible_check_mode
+  tags: [etcd, etcd_start, etcd_status]

@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "api.fullname" . }}-migration
+  labels:
+    {{- include "api.labels" . | nindent 4 }}
+data:
+  init.sql: |
+    -- Migration from /app/Migrations/init.sql
+    create sequence if not exists public.cities_id_seq;
+    create sequence if not exists public.forecast_id_seq;
+
+    create table if not exists public.cities (
+        id bigint primary key not null default nextval('cities_id_seq'::regclass),
+        name character varying(255)
+    );
+
+    create table if not exists public.forecast (
+        id bigint primary key not null default nextval('forecast_id_seq'::regclass),
+        "cityId" bigint,
+        "dateTime" bigint,
+        temperature integer,
+        summary text,
+        foreign key ("cityId") references public.cities (id)
+            match simple on update no action on delete cascade
+    );
+

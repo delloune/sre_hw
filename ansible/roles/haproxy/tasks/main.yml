@@ -1,0 +1,70 @@
+---
+- name: Install HAProxy
+  block:
+    - name: Install HAProxy (Debian)
+      ansible.builtin.apt:
+        name: haproxy
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Install HAProxy (RedHat)
+      ansible.builtin.dnf:
+        name: haproxy
+        state: present
+      when: ansible_os_family == "RedHat"
+  tags: [haproxy, load_balancing]
+
+- name: Configure system for HAProxy
+  block:
+    - name: Enable ip_nonlocal_bind
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_nonlocal_bind
+        value: "1"
+        sysctl_set: true
+        state: present
+        reload: true
+      ignore_errors: true
+
+    - name: Create HAProxy directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: haproxy
+        group: haproxy
+      loop:
+        - /etc/haproxy
+        - /run/haproxy
+        - /var/lib/haproxy/dev
+  tags: [haproxy, load_balancing]
+
+- name: Configure HAProxy
+  block:
+    - name: Generate HAProxy config
+      ansible.builtin.template:
+        src: haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+        owner: haproxy
+        group: haproxy
+        mode: "0644"
+      notify: restart haproxy
+
+    - name: Start HAProxy
+      ansible.builtin.systemd:
+        name: haproxy
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: Wait for HAProxy stats
+      ansible.builtin.wait_for:
+        port: "{{ haproxy_listen_port.stats }}"
+        host: "{{ bind_address }}"
+        state: started
+        timeout: 30
+        delay: 2
+
+    - name: Display HAProxy status
+      ansible.builtin.debug:
+        msg: "HAProxy running on {{ bind_address }}:{{ haproxy_listen_port.stats }}"
+  tags: [haproxy, haproxy_conf, load_balancing]

@@ -1,0 +1,17 @@
+[Unit]
+Description=Runners to orchestrate a high-availability PostgreSQL
+After=syslog.target network.target
+
+[Service]
+Type=notify
+User=postgres
+Group=postgres
+ExecStart={% if patroni_binary is defined and patroni_binary | length > 0 %}{{ patroni_binary }}{% else %}/usr/local/bin/patroni{% endif %} /etc/patroni/patroni.yml
+KillMode=process
+TimeoutSec=30
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+
