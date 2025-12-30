@@ -1,5 +1,5 @@
 ---
-patroni_cluster_name: "postgres-cluster-12-student-test1"
+patroni_cluster_name: "postgress-cluster-12-student-test"
 
 # Credentials (set via environment variables)
 patroni_superuser_username: "postgres"

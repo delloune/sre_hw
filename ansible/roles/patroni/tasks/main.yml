@@ -805,6 +805,17 @@
     msg: "Patroni {{ patroni_cluster_name }} running on {{ ansible_hostname }}"
   tags: [patroni, patroni_status]
 
+- name: Debug API database password
+  ansible.builtin.debug:
+    msg: |
+      api_database_password status:
+      - defined: {{ api_database_password is defined }}
+      - length: {{ api_database_password | default('') | length }}
+      - env var exists: {{ lookup('env', 'API_DATABASE_PASSWORD') | default('NOT_SET') != 'NOT_SET' }}
+      - env var length: {{ lookup('env', 'API_DATABASE_PASSWORD') | default('') | length }}
+  when: inventory_hostname in groups['master']
+  tags: [patroni, postgresql_users]
+
 - name: Create API user
   become: true
   become_user: postgres
@@ -819,6 +830,8 @@
   when:
     - inventory_hostname in groups['master']
     - api_database_user is defined
+    - api_database_password is defined
+    - api_database_password | length > 0
   tags: [patroni, postgresql_users]
 
 - name: Create API database
@@ -837,4 +850,7 @@
   when:
     - inventory_hostname in groups['master']
     - api_database_name is defined
+    - api_database_user is defined
+    - api_database_password is defined
+    - api_database_password | length > 0
   tags: [patroni, postgresql_databases]

@@ -36,3 +36,4 @@ curl -H "Host: api.student12.local" http://77.105.182.79/swagger/index.html
 ```
 
 ![API verification](png/curl.png)
+![API verification2](png/curl2.png)

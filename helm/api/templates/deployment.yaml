@@ -81,7 +81,7 @@ spec:
                   name: {{ include "api.fullname" . }}-db-secret
                   key: password
             - name: ConnectionStrings__PgConnection
-              value: "server={{ .Values.database.host }}; port={{ .Values.database.port }}; database={{ .Values.database.name }}; user id={{ .Values.database.user }}; password=$(DATABASE_PASSWORD)"
+              value: "server={{ .Values.database.host }}; port={{ .Values.database.port }}; database={{ .Values.database.name }}; user id={{ .Values.database.user }}; password={{ .Values.database.password }}"
             - name: ASPNETCORE_ENVIRONMENT
               value: "Development"
           livenessProbe:

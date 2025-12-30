@@ -33,7 +33,7 @@ listen master
     http-check expect status 200
     default-server inter 3s fastinter 1s fall 3 rise 4 on-marked-down shutdown-sessions
 {% for host in groups['postgres_cluster'] %}
-server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['bind_address'] }}:{{ postgresql_port }} check port {{ patroni_restapi_port }}
+server {{ host }} {{ hostvars[host]['bind_address'] }}:{{ postgresql_port }} check port {{ patroni_restapi_port }}
 {% endfor %}
 
 listen replicas
@@ -44,6 +44,6 @@ listen replicas
     http-check expect status 200
     default-server inter 3s fastinter 1s fall 3 rise 2 on-marked-down shutdown-sessions
 {% for host in groups['postgres_cluster'] %}
-server {{ hostvars[host]['ansible_hostname'] }} {{ hostvars[host]['bind_address'] }}:{{ postgresql_port }} check port {{ patroni_restapi_port }}
+server {{ host }} {{ hostvars[host]['bind_address'] }}:{{ postgresql_port }} check port {{ patroni_restapi_port }}
 {% endfor %}
 
